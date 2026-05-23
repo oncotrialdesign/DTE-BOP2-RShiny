@@ -1,0 +1,1374 @@
+
+
+library(shiny)
+library(shinydashboard)
+library(shinyjs)
+library(DT)
+library(ggplot2)
+library(truncdist)
+library(plotly)
+library(parallel)
+
+
+rinvgamma <- function(n, shape, rate = 1, scale = 1/rate) {
+  1 / rgamma(n, shape = shape, rate = 1/scale)
+}
+dinvgamma <- function(x, shape, rate = 1, scale = 1/rate) {
+  ifelse(x > 0,
+    (1/scale)^shape / gamma(shape) * x^(-shape-1) * exp(-1/(x*scale)),
+    0)
+}
+qinvgamma <- function(p, shape, rate = 1, scale = 1/rate) {
+  1 / qgamma(1-p, shape=shape, rate=1/scale)
+}
+
+# ── Core DTE-BOP2 functions ───────────────────────────────────────────────────
+
+# Fit truncated Gamma prior for S from expert elicitation
+fit_prior_S <- function(L, U, mean_val=NULL, median_val=NULL, sd_val=NULL,
+                        q025=NULL, q975=NULL,
+                        weights=c(4,4,2,1,1)) {
+  # WLS objective: minimise discrepancy between theoretical and elicited summaries
+  objective <- function(params) {
+    s1 <- exp(params[1]); s2 <- exp(params[2])
+    loss <- 0
+    if (!is.null(mean_val) && !is.na(mean_val)) {
+      th_mean <- tryCatch(mean(truncdist::rtrunc(5000,"gamma",a=L,b=U,shape=s1,scale=s2)),
+                          error=function(e) NA)
+      if (!is.na(th_mean)) loss <- loss + weights[1]*(th_mean - mean_val)^2
+    }
+    if (!is.null(median_val) && !is.na(median_val)) {
+      th_med <- tryCatch(median(truncdist::rtrunc(5000,"gamma",a=L,b=U,shape=s1,scale=s2)),
+                         error=function(e) NA)
+      if (!is.na(th_med)) loss <- loss + weights[2]*(th_med - median_val)^2
+    }
+    if (!is.null(sd_val) && !is.na(sd_val)) {
+      th_sd <- tryCatch(sd(truncdist::rtrunc(5000,"gamma",a=L,b=U,shape=s1,scale=s2)),
+                        error=function(e) NA)
+      if (!is.na(th_sd)) loss <- loss + weights[3]*(th_sd - sd_val)^2
+    }
+    if (!is.null(q025) && !is.na(q025)) {
+      th_q025 <- tryCatch(quantile(truncdist::rtrunc(5000,"gamma",a=L,b=U,shape=s1,scale=s2),0.025),
+                          error=function(e) NA)
+      if (!is.na(th_q025)) loss <- loss + weights[4]*(th_q025 - q025)^2
+    }
+    if (!is.null(q975) && !is.na(q975)) {
+      th_q975 <- tryCatch(quantile(truncdist::rtrunc(5000,"gamma",a=L,b=U,shape=s1,scale=s2),0.975),
+                          error=function(e) NA)
+      if (!is.na(th_q975)) loss <- loss + weights[5]*(th_q975 - q975)^2
+    }
+    if (is.na(loss) || is.infinite(loss)) return(1e10)
+    loss
+  }
+  init <- c(log(2), log((L+U)/4))
+  res <- tryCatch(
+    optim(init, objective, method="Nelder-Mead",
+          control=list(maxit=2000, reltol=1e-8)),
+    error=function(e) NULL
+  )
+  if (is.null(res)) return(list(s1=2, s2=0.5, converged=FALSE))
+  list(s1=exp(res$par[1]), s2=exp(res$par[2]), converged=(res$convergence==0))
+}
+
+# Convert clinical overall median mu1_bar to model mu1_tilde given S
+clinical_to_model_median <- function(mu0_bar, mu1_bar, S) {
+  # From equation (8): mu1_bar = (1 - mu1_tilde/mu0_bar)*S + mu1_tilde  if mu0_bar >= S
+  # mu1_bar = mu0_bar                                                     if mu0_bar < S
+  if (mu0_bar < S) return(mu0_bar)  # no treatment effect before S
+  # solve: mu1_bar = S*(1 - mu1t/mu0_bar) + mu1t
+  # mu1_bar = S - S*mu1t/mu0_bar + mu1t = S + mu1t*(1 - S/mu0_bar)
+  mu1_tilde <- (mu1_bar - S) / (1 - S/mu0_bar)
+  pmax(mu1_tilde, 0.001)
+}
+
+# Simulate one trial dataset under H0 or H1 (piecewise exponential)
+sim_trial_data <- function(n_per_arm, mu0_bar, mu1_bar=NULL, S=NULL,
+                           accrual_rate=NULL, null=FALSE) {
+  n0 <- n_per_arm; n1 <- n_per_arm
+  # Control: Exp(mu0_bar)
+  t0 <- rexp(n0, rate=1/mu0_bar)
+  if (null) {
+    t1 <- rexp(n1, rate=1/mu0_bar)
+  } else {
+    # Piecewise exponential treatment arm
+    mu1_tilde <- clinical_to_model_median(mu0_bar, mu1_bar, S)
+    t1 <- numeric(n1)
+    for (i in 1:n1) {
+      u <- runif(1)
+      # CDF of piecewise exp: F(t) = 1 - exp(-t/mu0_bar) for t < S
+      #                                1 - exp(-S/mu0_bar - (t-S)/mu1_tilde) for t >= S
+      p_before_S <- 1 - exp(-S/mu0_bar)
+      if (u < p_before_S) {
+        t1[i] <- -mu0_bar * log(1 - u)
+      } else {
+        u2 <- (u - p_before_S) / (1 - p_before_S)
+        t1[i] <- S - mu1_tilde * log(1 - u2)
+      }
+    }
+  }
+  list(t0=t0, t1=t1)
+}
+
+# Compute P(mu1_tilde < mu0_tilde | data, S) using Lemma 1
+compute_posterior_prob <- function(t0, t1, delta0, delta1, S, a0, b0, a1, b1) {
+  # Events and TTOT
+  d0  <- sum(delta0)
+  # For treatment arm: partition at S
+  d01 <- sum(delta1[t1 <= S])   # events before S
+  d11 <- sum(delta1[t1 >  S])   # events after  S
+  TTOT_0_S  <- sum(pmin(t1, S))                       # TTOT(0, S) treatment arm
+  TTOT_S_tau <- sum(pmax(0, t1 - S))                  # TTOT(S, tau) treatment arm
+  sum_z0    <- sum(t0)
+
+  # Beta parameter (Lemma 1)
+  beta_param <- (b0 + TTOT_0_S + sum_z0) /
+                (b0 + b1 + sum_z0 + TTOT_0_S + TTOT_S_tau)
+
+  # K ~ Beta(a0 + d0 + d01, a1 + d11)
+  alpha_K <- a0 + d0 + d01
+  beta_K  <- a1 + d11
+
+  # P(mu1_tilde < mu0_tilde) = P(K < beta_param)
+  prob <- pbeta(beta_param, alpha_K, beta_K)
+  prob
+}
+
+# Adaptive threshold C(n) = 1 - lambda*(n/N)^gamma
+threshold_C <- function(n, N, lambda, gamma) {
+  1 - lambda * (n/N)^gamma
+}
+
+# Single trial simulation for operating characteristics
+simulate_one_trial <- function(n_interim, N_total, lambda, gamma,
+                               mu0_bar, mu1_bar=NULL, S_val=NULL,
+                               a0, b0, a1, b1, null=FALSE) {
+  n_per_arm_final <- N_total
+  # Generate full dataset
+  dat <- sim_trial_data(n_per_arm_final, mu0_bar, mu1_bar, S_val, null=null)
+  t0_all <- dat$t0; t1_all <- dat$t1
+
+  # Simulate administrative censoring (everyone followed to max follow-up)
+  # We use observed times as event times with event indicator = 1 for simplicity
+  delta0 <- rep(1, n_per_arm_final)
+  delta1 <- rep(1, n_per_arm_final)
+
+  # Interim analyses
+  stopped_early <- FALSE
+  for (ni in n_interim) {
+    t0 <- t0_all[1:ni]; t1 <- t1_all[1:ni]
+    d0 <- delta0[1:ni]; d1 <- delta1[1:ni]
+    S_use <- if (!is.null(S_val)) S_val else median(c(t0, t1)) * 0.5
+
+    prob <- compute_posterior_prob(t0, t1, d0, d1, S_use, a0, b0, a1, b1)
+    C_n  <- threshold_C(ni, N_total, lambda, gamma)
+
+    if (prob > C_n) {
+      stopped_early <- TRUE
+      break
+    }
+  }
+
+  if (stopped_early) return(list(reject=FALSE, stopped_early=TRUE, n_used=ni*2))
+
+  # Final analysis
+  t0 <- t0_all; t1 <- t1_all
+  d0 <- delta0;  d1 <- delta1
+  S_use <- if (!is.null(S_val)) S_val else median(c(t0, t1)) * 0.5
+  prob <- compute_posterior_prob(t0, t1, d0, d1, S_use, a0, b0, a1, b1)
+  C_N  <- threshold_C(N_total, N_total, lambda, gamma)
+
+  reject <- (prob <= C_N)
+  list(reject=reject, stopped_early=FALSE, n_used=N_total*2)
+}
+
+# Grid search for optimal (lambda, gamma)
+find_optimal_params <- function(N_total, n_interim, mu0_bar, mu1_bar,
+                                S_vec, s1, s2, L, U,
+                                a0, b0, a1, b1,
+                                alpha=0.05, n_sim=2000,
+                                lambda_grid=seq(0.1, 0.9, by=0.1),
+                                gamma_grid=seq(0.5, 2.0, by=0.25)) {
+  results <- list()
+  for (lam in lambda_grid) {
+    for (gam in gamma_grid) {
+      # Type I error: simulate under H0
+      rej_h0 <- replicate(n_sim, {
+        S_s <- rtrunc(1, "gamma", a=L, b=U, shape=s1, scale=s2)
+        r <- simulate_one_trial(n_interim, N_total, lam, gam,
+                                mu0_bar, null=TRUE, S_val=S_s,
+                                a0=a0, b0=b0, a1=a1, b1=b1)
+        as.numeric(r$reject)
+      })
+      t1e <- mean(rej_h0)
+      if (t1e <= alpha) {
+        rej_h1 <- replicate(n_sim, {
+          S_s <- rtrunc(1, "gamma", a=L, b=U, shape=s1, scale=s2)
+          r <- simulate_one_trial(n_interim, N_total, lam, gam,
+                                  mu0_bar, mu1_bar=mu1_bar, S_val=S_s, null=FALSE,
+                                  a0=a0, b0=b0, a1=a1, b1=b1)
+          as.numeric(r$reject)
+        })
+        pwr <- mean(rej_h1)
+        results[[length(results)+1]] <- list(lambda=lam, gamma=gam, t1e=t1e, power=pwr)
+      }
+    }
+  }
+  if (length(results)==0) return(NULL)
+  df <- do.call(rbind, lapply(results, as.data.frame))
+  df[which.max(df$power), ]
+}
+
+# Operating characteristics via simulation
+compute_oc <- function(N_total, n_interim, lambda, gamma,
+                       mu0_bar, mu1_bar, S_fixed=NULL,
+                       s1=NULL, s2=NULL, L=NULL, U=NULL,
+                       a0, b0, a1, b1, n_sim=2000, use_prior=TRUE) {
+  rej_h0 <- numeric(n_sim); es_h0 <- numeric(n_sim); nu_h0 <- numeric(n_sim)
+  rej_h1 <- numeric(n_sim); es_h1 <- numeric(n_sim); nu_h1 <- numeric(n_sim)
+
+  for (i in 1:n_sim) {
+    S_use <- if (use_prior) rtrunc(1,"gamma",a=L,b=U,shape=s1,scale=s2) else S_fixed
+
+    r0 <- simulate_one_trial(n_interim, N_total, lambda, gamma,
+                             mu0_bar, null=TRUE, S_val=S_use,
+                             a0=a0, b0=b0, a1=a1, b1=b1)
+    rej_h0[i] <- as.numeric(r0$reject)
+    es_h0[i]  <- as.numeric(r0$stopped_early)
+    nu_h0[i]  <- r0$n_used
+
+    r1 <- simulate_one_trial(n_interim, N_total, lambda, gamma,
+                             mu0_bar, mu1_bar=mu1_bar, S_val=S_use, null=FALSE,
+                             a0=a0, b0=b0, a1=a1, b1=b1)
+    rej_h1[i] <- as.numeric(r1$reject)
+    es_h1[i]  <- as.numeric(r1$stopped_early)
+    nu_h1[i]  <- r1$n_used
+  }
+
+  list(
+    type1_error = mean(rej_h0),
+    power       = mean(rej_h1),
+    pes_h0      = mean(es_h0),
+    pes_h1      = mean(es_h1),
+    avg_n_h0    = mean(nu_h0),
+    avg_n_h1    = mean(nu_h1)
+  )
+}
+
+# Interim/Final Analysis
+run_analysis <- function(t0, t1, delta0, delta1, S_val, n_total,
+                         lambda, gamma, a0, b0, a1, b1, stage="final") {
+  n_curr <- length(t0)
+  prob <- compute_posterior_prob(t0, t1, delta0, delta1, S_val, a0, b0, a1, b1)
+  C_n  <- threshold_C(n_curr, n_total, lambda, gamma)
+
+  decision <- if (stage == "interim") {
+    if (prob > C_n) "Stop for Futility" else "Continue"
+  } else {
+    if (prob <= C_n) "Reject H0 (Efficacy)" else "Fail to Reject H0"
+  }
+
+  list(
+    posterior_prob = prob,
+    threshold      = C_n,
+    decision       = decision,
+    n_arm          = n_curr,
+    events_control = sum(delta0),
+    events_treat   = sum(delta1)
+  )
+}
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+ui <- dashboardPage(
+  skin = "blue",
+
+  dashboardHeader(
+    title = tags$span(
+      tags$img(src="", style="height:24px; margin-right:6px"),
+      "DTE-BOP2 Trial Designer"
+    ),
+    titleWidth = 280
+  ),
+
+  dashboardSidebar(
+    width = 260,
+    useShinyjs(),
+    sidebarMenu(
+      id = "tabs",
+      menuItem("Overview",            tabName="overview",   icon=icon("home")),
+      menuItem("Prior Elicitation",   tabName="prior",      icon=icon("chart-area")),
+      menuItem("Sample Size",         tabName="samplesize", icon=icon("users")),
+      menuItem("Design Calibration",  tabName="calibrate",  icon=icon("sliders-h")),
+      menuItem("Operating Char.",     tabName="oc",         icon=icon("chart-bar")),
+      menuItem("Interim / Final",     tabName="analysis",   icon=icon("stethoscope")),
+      menuItem("About",               tabName="about",      icon=icon("info-circle"))
+    ),
+    hr(),
+    tags$div(style="padding:10px; font-size:11px; color:#aaa;",
+      "DTE-BOP2 v1.0 | Cai & Pan (2025)",
+      br(), "St. Jude Children's Research Hospital"
+    )
+  ),
+
+  dashboardBody(
+    tags$head(tags$style(HTML("
+      .content-wrapper, .right-side { background-color: #f5f7fa; }
+      .box { border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.08); }
+      .box-header { background: linear-gradient(135deg,#2c3e50,#3498db) !important;
+                    border-radius:8px 8px 0 0 !important; color:white !important; }
+      .box-header .box-title { color:white !important; font-weight:600; }
+      .info-box { border-radius:8px; }
+      h4.result-label { color:#2c3e50; font-weight:700; margin-top:5px; }
+      .decision-box { padding:15px; border-radius:8px; text-align:center;
+                      font-size:16px; font-weight:700; margin-top:10px; }
+      .decision-continue  { background:#27ae60; color:white; }
+      .decision-stop      { background:#e74c3c; color:white; }
+      .decision-reject    { background:#27ae60; color:white; }
+      .decision-fail      { background:#f39c12; color:white; }
+      .param-well { background:#ecf0f1; border-radius:8px; padding:15px;
+                    border:1px solid #bdc3c7; }
+      .shiny-input-container { margin-bottom:8px; }
+      .section-title { color:#2980b9; font-size:13px; font-weight:700;
+                       text-transform:uppercase; letter-spacing:1px;
+                       border-bottom:2px solid #2980b9; padding-bottom:4px;
+                       margin:15px 0 10px 0; }
+      .formula-box { background:#fff; border-left:4px solid #3498db;
+                     padding:12px 15px; margin:10px 0; border-radius:0 6px 6px 0;
+                     font-family:monospace; font-size:13px; }
+    "))),
+
+    tabItems(
+
+      # ── OVERVIEW ─────────────────────────────────────────────────────────
+      tabItem(tabName="overview",
+        fluidRow(
+          column(12,
+            box(width=12, status="primary",
+              title=tagList(icon("dna"), " DTE-BOP2: Bayesian Optimal Phase II Design for Trials with Delayed Treatment Effects"),
+              fluidRow(
+                column(6,
+                  h4("Background", style="color:#2c3e50;"),
+                  p("Immunotherapy trials often exhibit ", strong("Delayed Treatment Effects (DTEs)"),
+                    " — a period where treatment and control survival curves overlap before diverging. ",
+                    "Standard designs (log-rank, BOP2) suffer from reduced power and inflated type I error under non-proportional hazards."),
+                  p("DTE-BOP2 extends the Bayesian Optimal Phase II (BOP2) design by explicitly modelling ",
+                    "the uncertainty in the separation timepoint ", em("S"), " using a ", strong("truncated Gamma prior"), "."),
+                  h4("Key Features", style="color:#2c3e50;"),
+                  tags$ul(
+                    tags$li("Rigorous type I and type II error control under delayed effects"),
+                    tags$li("Expert-elicited truncated Gamma prior for delay timepoint S"),
+                    tags$li("Piecewise exponential model for treatment arm survival"),
+                    tags$li("Adaptive futility stopping threshold C(n) = 1 − λ(n/N)^γ"),
+                    tags$li("Multi-stage group sequential with Go/No-Go decision rules"),
+                    tags$li("Higher power with smaller samples vs. standard BOP2")
+                  )
+                ),
+                column(6,
+                  h4("Statistical Framework", style="color:#2c3e50;"),
+                  div(class="formula-box",
+                    "Treatment arm (piecewise exponential):",br(),
+                    "f(t) = Exp(1/μ₀)   for 0 < t < S",br(),
+                    "f(t) = Exp(1/μ₁)   for t ≥ S",br(),br(),
+                    "Prior for delay: S ~ Gamma(s₁, s₂) I(L, U)",br(),br(),
+                    "Decision rule (futility):",br(),
+                    "Stop if P(μ̃₁ < μ̃₀ | Data, S) > C(n)",br(),br(),
+                    "Adaptive threshold:",br(),
+                    "C(n) = 1 − λ·(n/N)^γ"
+                  ),
+                  h4("Workflow", style="color:#2c3e50;"),
+                  tags$ol(
+                    tags$li("Elicit prior for delay timepoint S"),
+                    tags$li("Specify sample size (N) and interim looks"),
+                    tags$li("Calibrate optimal (λ, γ) controlling type I error"),
+                    tags$li("Evaluate operating characteristics via simulation"),
+                    tags$li("Conduct interim/final analyses using the design")
+                  )
+                )
+              )
+            )
+          )
+        ),
+        fluidRow(
+          infoBox("Method", "DTE-BOP2", icon=icon("flask"), color="blue", width=3),
+          infoBox("Design", "Two-Arm RCT", icon=icon("random"), color="green", width=3),
+          infoBox("Endpoint", "Time-to-Event", icon=icon("clock"), color="yellow", width=3),
+          infoBox("Framework", "Bayesian", icon=icon("chart-line"), color="purple", width=3)
+        )
+      ),
+
+      # ── PRIOR ELICITATION ────────────────────────────────────────────────
+      tabItem(tabName="prior",
+        fluidRow(
+          column(4,
+            box(width=12, status="primary", title=tagList(icon("cog"), " Prior Specification"),
+              div(class="section-title", "Delay Timepoint Bounds"),
+              numericInput("L", "Lower bound L (months)", value=2, min=0, step=0.5),
+              numericInput("U", "Upper bound U (months)", value=4, min=0, step=0.5),
+              hr(),
+              div(class="section-title", "Expert Elicitation (optional)"),
+              p(style="font-size:11px; color:#666;",
+                "Provide any subset of summary statistics below. Leave blank if unknown."),
+              numericInput("mean_S",  "Expected mean of S",   value=3,    min=0, step=0.5),
+              numericInput("med_S",   "Median of S",          value=NA,   min=0, step=0.5),
+              numericInput("sd_S",    "Std deviation of S",   value=NA,   min=0, step=0.5),
+              numericInput("q025_S",  "2.5th percentile",     value=NA,   min=0, step=0.5),
+              numericInput("q975_S",  "97.5th percentile",    value=NA,   min=0, step=0.5),
+              hr(),
+              div(class="section-title", "Prior Parameters (manual override)"),
+              p(style="font-size:11px; color:#666;",
+                "Or specify shape/scale directly:"),
+              numericInput("s1_manual", "Shape (s₁)", value=NA, min=0.01, step=0.5),
+              numericInput("s2_manual", "Scale (s₂)", value=NA, min=0.001, step=0.1),
+              hr(),
+              actionButton("fit_prior", "Fit / Update Prior",
+                           class="btn btn-primary btn-block",
+                           icon=icon("play"))
+            )
+          ),
+          column(8,
+            box(width=12, status="info", title=tagList(icon("chart-area"), " Prior Distribution for S"),
+              fluidRow(
+                column(4, valueBoxOutput("prior_s1_box", width=NULL)),
+                column(4, valueBoxOutput("prior_s2_box", width=NULL)),
+                column(4, valueBoxOutput("prior_mean_box", width=NULL))
+              ),
+              plotlyOutput("prior_plot", height="350px"),
+              hr(),
+              fluidRow(
+                column(6,
+                  h5("Prior Summary Statistics"),
+                  tableOutput("prior_summary_table")
+                ),
+                column(6,
+                  h5("Interpretation"),
+                  uiOutput("prior_interpretation")
+                )
+              )
+            )
+          )
+        )
+      ),
+
+      # ── SAMPLE SIZE ──────────────────────────────────────────────────────
+      tabItem(tabName="samplesize",
+        fluidRow(
+          column(4,
+            box(width=12, status="primary", title=tagList(icon("calculator"), " Trial Parameters"),
+              div(class="section-title", "Hypothesis"),
+              numericInput("mu0_bar", "Control median survival (H₀, months)", value=4, min=0.5, step=0.5),
+              numericInput("mu1_bar", "Treatment median survival (H₁, months)", value=7, min=0.5, step=0.5),
+              numericInput("S_design","Assumed S for sample size (months)", value=2.5, min=0, step=0.5),
+              hr(),
+              div(class="section-title", "Error Rates"),
+              numericInput("alpha_ss",  "Type I error (α)", value=0.10, min=0.01, max=0.20, step=0.01),
+              numericInput("power_ss",  "Target power (1−β)", value=0.80, min=0.50, max=0.99, step=0.05),
+              hr(),
+              div(class="section-title", "Prior Parameters"),
+              numericInput("a0_ss", "a₀ (control prior shape)", value=1, min=0.01, step=0.5),
+              numericInput("b0_ss", "b₀ (control prior scale)", value=4, min=0.01, step=0.5),
+              numericInput("a1_ss", "a₁ (treatment prior shape)", value=1, min=0.01, step=0.5),
+              numericInput("b1_ss", "b₁ (treatment prior scale)", value=7, min=0.01, step=0.5),
+              p(style="font-size:11px; color:#666;",
+                "Recommendation: b₀ = μ₀ and b₁ = 2·μ₀ (weakly informative, Zhou et al. 2020)"),
+              hr(),
+              div(class="section-title", "Interim Looks"),
+              numericInput("n_interim_ss", "Number of interim analyses", value=1, min=0, max=5, step=1),
+              uiOutput("interim_fraction_ui_ss"),
+              hr(),
+              actionButton("calc_ss", "Calculate Sample Size",
+                           class="btn btn-success btn-block", icon=icon("calculator"))
+            )
+          ),
+          column(8,
+            box(width=12, status="info", title=tagList(icon("users"), " Sample Size Results"),
+              uiOutput("ss_results_ui"),
+              hr(),
+              plotlyOutput("ss_power_curve", height="350px")
+            )
+          )
+        )
+      ),
+
+      # ── DESIGN CALIBRATION ───────────────────────────────────────────────
+      tabItem(tabName="calibrate",
+        fluidRow(
+          column(4,
+            box(width=12, status="primary", title=tagList(icon("sliders-h"), " Calibration Settings"),
+              div(class="section-title", "Design Parameters"),
+              numericInput("N_cal",   "Total sample size (2N)", value=60,  min=10, step=10),
+              uiOutput("interim_sizes_ui"),
+              hr(),
+              div(class="section-title", "Clinical Parameters"),
+              numericInput("mu0_cal", "Control median (H₀, months)",    value=4, min=0.5, step=0.5),
+              numericInput("mu1_cal", "Treatment median (H₁, months)",  value=7, min=0.5, step=0.5),
+              hr(),
+              div(class="section-title", "Prior for S (from Prior tab)"),
+              numericInput("L_cal",  "L", value=2, min=0, step=0.5),
+              numericInput("U_cal",  "U", value=4, min=0, step=0.5),
+              numericInput("s1_cal", "s₁ (shape)", value=12.86, min=0.01, step=0.5),
+              numericInput("s2_cal", "s₂ (scale)", value=0.19,  min=0.001, step=0.01),
+              hr(),
+              div(class="section-title", "Prior for μ₀, μ₁"),
+              numericInput("a0_cal", "a₀", value=1, min=0.01, step=0.5),
+              numericInput("b0_cal", "b₀", value=4, min=0.01, step=0.5),
+              numericInput("a1_cal", "a₁", value=1, min=0.01, step=0.5),
+              numericInput("b1_cal", "b₁", value=7, min=0.01, step=0.5),
+              hr(),
+              div(class="section-title", "Search Grid"),
+              numericInput("alpha_cal", "Target type I error (α)", value=0.10, min=0.01, max=0.20, step=0.01),
+              numericInput("n_sim_cal", "Simulations per (λ,γ) pair",   value=500,  min=100, max=5000, step=100),
+              sliderInput("lambda_range", "λ range",  min=0.05, max=0.99, value=c(0.1, 0.9), step=0.05),
+              sliderInput("gamma_range",  "γ range",  min=0.1,  max=3.0,  value=c(0.5, 2.0), step=0.25),
+              hr(),
+              actionButton("run_calibration", "Run Calibration",
+                           class="btn btn-warning btn-block", icon=icon("cogs")),
+              br(),
+              p(style="font-size:11px; color:#e67e22;",
+                icon("exclamation-triangle"),
+                " Calibration may take 1–3 minutes depending on grid size and n_sim.")
+            )
+          ),
+          column(8,
+            box(width=12, status="info", title=tagList(icon("star"), " Optimal Design Parameters"),
+              uiOutput("cal_results_ui"),
+              hr(),
+              plotlyOutput("cal_grid_plot", height="380px"),
+              hr(),
+              h5("Threshold Function C(n)"),
+              plotlyOutput("threshold_plot", height="250px")
+            )
+          )
+        )
+      ),
+
+      # ── OPERATING CHARACTERISTICS ────────────────────────────────────────
+      tabItem(tabName="oc",
+        fluidRow(
+          column(4,
+            box(width=12, status="primary", title=tagList(icon("chart-bar"), " OC Settings"),
+              div(class="section-title", "Design Parameters"),
+              numericInput("N_oc",      "Total sample size (2N)", value=60, min=10, step=10),
+              numericInput("lambda_oc", "λ (from calibration)",  value=0.5, min=0.01, max=0.99, step=0.05),
+              numericInput("gamma_oc",  "γ (from calibration)",  value=1.0, min=0.1,  max=5.0, step=0.25),
+              uiOutput("interim_oc_ui"),
+              hr(),
+              div(class="section-title", "Clinical Scenarios"),
+              numericInput("mu0_oc",  "Control median (months)",   value=4, min=0.5, step=0.5),
+              numericInput("mu1_oc",  "Treatment median (months)", value=7, min=0.5, step=0.5),
+              hr(),
+              div(class="section-title", "Prior for S"),
+              radioButtons("S_spec_oc", "Specify S as:",
+                           choices=c("Fixed value"="fixed", "Prior distribution"="prior"),
+                           selected="prior"),
+              conditionalPanel("input.S_spec_oc == 'fixed'",
+                numericInput("S_fixed_oc", "Fixed S (months)", value=2.5, min=0, step=0.5)
+              ),
+              conditionalPanel("input.S_spec_oc == 'prior'",
+                numericInput("L_oc",  "L", value=2,    min=0, step=0.5),
+                numericInput("U_oc",  "U", value=4,    min=0, step=0.5),
+                numericInput("s1_oc", "s₁ (shape)", value=12.86, min=0.01, step=0.5),
+                numericInput("s2_oc", "s₂ (scale)", value=0.19,  min=0.001, step=0.01)
+              ),
+              hr(),
+              div(class="section-title", "Prior for μ₀, μ₁"),
+              numericInput("a0_oc", "a₀", value=1, min=0.01, step=0.5),
+              numericInput("b0_oc", "b₀", value=4, min=0.01, step=0.5),
+              numericInput("a1_oc", "a₁", value=1, min=0.01, step=0.5),
+              numericInput("b1_oc", "b₁", value=7, min=0.01, step=0.5),
+              numericInput("n_sim_oc", "Number of simulations", value=1000, min=100, max=10000, step=100),
+              hr(),
+              div(class="section-title", "Sensitivity Analysis"),
+              p(style="font-size:11px; color:#666;",
+                "Vary S to plot power/type I error profile:"),
+              checkboxInput("run_sensitivity", "Run sensitivity analysis over S", value=FALSE),
+              conditionalPanel("input.run_sensitivity",
+                sliderInput("S_range_oc", "S range (months)",
+                            min=0.5, max=10, value=c(0.5, 5), step=0.5)
+              ),
+              hr(),
+              actionButton("run_oc", "Compute Operating Characteristics",
+                           class="btn btn-info btn-block", icon=icon("play")),
+              br(),
+              p(style="font-size:11px; color:#3498db;",
+                icon("info-circle"), " Larger n_sim = more accurate but slower.")
+            )
+          ),
+          column(8,
+            box(width=12, status="info", title=tagList(icon("table"), " Operating Characteristics"),
+              uiOutput("oc_results_ui"),
+              hr(),
+              plotlyOutput("oc_bar_plot",    height="300px"),
+              hr(),
+              conditionalPanel("input.run_sensitivity",
+                h5("Sensitivity: Power/Type I Error vs. S"),
+                plotlyOutput("oc_sensitivity_plot", height="300px")
+              )
+            )
+          )
+        )
+      ),
+
+      # ── INTERIM / FINAL ANALYSIS ─────────────────────────────────────────
+      tabItem(tabName="analysis",
+        fluidRow(
+          column(4,
+            box(width=12, status="primary", title=tagList(icon("stethoscope"), " Analysis Settings"),
+              div(class="section-title", "Design Parameters"),
+              numericInput("N_an",      "Total sample size per arm (N)", value=30, min=5, step=5),
+              numericInput("lambda_an", "λ", value=0.5, min=0.01, max=0.99, step=0.05),
+              numericInput("gamma_an",  "γ", value=1.0, min=0.1, max=5.0, step=0.25),
+              numericInput("S_an",      "Assumed separation timepoint S (months)", value=2.5, min=0, step=0.5),
+              hr(),
+              div(class="section-title", "Prior Hyperparameters"),
+              numericInput("a0_an", "a₀", value=1, min=0.01, step=0.5),
+              numericInput("b0_an", "b₀", value=4, min=0.01, step=0.5),
+              numericInput("a1_an", "a₁", value=1, min=0.01, step=0.5),
+              numericInput("b1_an", "b₁", value=7, min=0.01, step=0.5),
+              hr(),
+              div(class="section-title", "Current Analysis Stage"),
+              radioButtons("stage_an", "Analysis stage:",
+                           choices=c("Interim"="interim", "Final"="final"),
+                           selected="interim"),
+              hr(),
+              div(class="section-title", "Enter Observed Data"),
+              p(style="font-size:11px; color:#666;",
+                "Enter comma-separated observed times and event indicators (0=censored, 1=event):"),
+              h5("Control Arm"),
+              textAreaInput("t0_an", "Observed times (t₀)", rows=3,
+                value="2.1,3.5,4.2,1.8,5.6,2.9,3.1,4.8,2.5,6.0"),
+              textAreaInput("d0_an", "Event indicators (δ₀)", rows=2,
+                value="1,1,1,1,0,1,1,1,1,0"),
+              h5("Treatment Arm"),
+              textAreaInput("t1_an", "Observed times (t₁)", rows=3,
+                value="3.2,5.1,6.8,2.5,7.2,4.1,5.9,7.5,4.8,8.1"),
+              textAreaInput("d1_an", "Event indicators (δ₁)", rows=2,
+                value="1,1,0,1,0,1,1,0,1,0"),
+              hr(),
+              actionButton("run_analysis_btn", "Run Analysis",
+                           class="btn btn-danger btn-block", icon=icon("search"))
+            )
+          ),
+          column(8,
+            box(width=12, status="info", title=tagList(icon("clipboard-check"), " Analysis Results"),
+              uiOutput("analysis_results_ui"),
+              hr(),
+              fluidRow(
+                column(6, plotlyOutput("analysis_posterior_plot", height="280px")),
+                column(6, plotlyOutput("analysis_km_plot",        height="280px"))
+              )
+            )
+          )
+        )
+      ),
+
+      # ── ABOUT ────────────────────────────────────────────────────────────
+      tabItem(tabName="about",
+        fluidRow(
+          column(8,
+            box(width=12, status="primary", title=tagList(icon("book"), " References & Method"),
+              h4("Reference"),
+              p(strong("Cai Z, Pan H (2025)."),
+                " A Bayesian Optimal Phase II Design for Randomized Immunotherapy Trials with Delayed Treatment Effects.",
+                em(" arXiv:2509.00238.")),
+              p("R Package: DTEBOP2 (v1.0.3) — CRAN. DOI: 10.32614/CRAN.package.DTEBOP2"),
+              hr(),
+              h4("Method Summary"),
+              p("DTE-BOP2 extends the BOP2 design (Zhou et al. 2020) to address non-proportional hazards ",
+                "from delayed treatment effects common in immunotherapy trials. The design:"),
+              tags$ol(
+                tags$li("Models treatment arm survival as piecewise exponential with separation at S"),
+                tags$li("Assigns a truncated Gamma prior to S: S ~ Gamma(s₁, s₂) I(L, U)"),
+                tags$li("Derives closed-form posterior P(μ̃₁ < μ̃₀ | Data, S) via Lemma 1 (Beta distribution)"),
+                tags$li("Applies adaptive futility stopping: stop if P(μ̃₁ < μ̃₀ | Data, S) > C(n)"),
+                tags$li("Calibrates (λ, γ) via grid search to control average type I error ≤ α"),
+                tags$li("Controls type I error both on average and at boundaries S = L and S = U")
+              ),
+              hr(),
+              h4("Motivating Example"),
+              p("CheckMate 017 trial (Brahmer et al. 2015): nivolumab vs. docetaxel in squamous NSCLC. ",
+                "PFS curves overlapped for ~2.5 months before diverging, demonstrating a classic DTE. ",
+                "DTE-BOP2 accounts for this using a prior with L=2, U=2.5 months."),
+              hr(),
+              h4("Acknowledgements"),
+              p("This Shiny application is based on the methodology and DTEBOP2 R package by ",
+                "Zhongheng Cai and Haitao Pan at St. Jude Children's Research Hospital.")
+            )
+          ),
+          column(4,
+            box(width=12, status="info", title=tagList(icon("code"), " Technical Details"),
+              h5("R Package"),
+              p(tags$code("install.packages('DTEBOP2')")),
+              tags$ul(
+                tags$li(tags$code("truncdist"), " — truncated distributions"),
+                tags$li(tags$code("invgamma"),  " — inverse-Gamma distributions"),
+                tags$li(tags$code("doParallel"), " — parallel computation"),
+                tags$li(tags$code("foreach"),   " — iteration utilities")
+              ),
+              hr(),
+              h5("Key Model Parameters"),
+              tags$table(class="table table-condensed",
+                tags$tr(tags$th("Symbol"), tags$th("Description")),
+                tags$tr(tags$td("S"), tags$td("Delay timepoint")),
+                tags$tr(tags$td("μ₀"), tags$td("Control median survival")),
+                tags$tr(tags$td("μ₁"), tags$td("Treat. median after S")),
+                tags$tr(tags$td("λ, γ"), tags$td("Threshold parameters")),
+                tags$tr(tags$td("s₁, s₂"), tags$td("Prior shape/scale for S")),
+                tags$tr(tags$td("L, U"), tags$td("Prior bounds for S")),
+                tags$tr(tags$td("a₀,b₀,a₁,b₁"), tags$td("Inv-Gamma prior params"))
+              ),
+              hr(),
+              h5("Links"),
+              tags$ul(
+                tags$li(tags$a("CRAN Package", href="https://CRAN.R-project.org/package=DTEBOP2", target="_blank")),
+                tags$li(tags$a("arXiv Paper",  href="https://arxiv.org/abs/2509.00238", target="_blank")),
+                tags$li(tags$a("Vignette",     href="https://cran.r-project.org/web/packages/DTEBOP2/vignettes/DTEBOP2.html", target="_blank"))
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+# ── SERVER ────────────────────────────────────────────────────────────────────
+server <- function(input, output, session) {
+
+  # Reactive values store
+  rv <- reactiveValues(
+    s1 = 12.86, s2 = 0.19,
+    L  = 2,     U  = 4,
+    lambda_opt = NULL, gamma_opt = NULL,
+    oc_results = NULL,
+    analysis_result = NULL
+  )
+
+  # ── PRIOR TAB ──────────────────────────────────────────────────────────────
+  observeEvent(input$fit_prior, {
+    req(input$L, input$U, input$L < input$U)
+
+    # Use manual override if provided
+    if (!is.na(input$s1_manual) && !is.na(input$s2_manual)) {
+      rv$s1 <- input$s1_manual
+      rv$s2 <- input$s2_manual
+      rv$L  <- input$L
+      rv$U  <- input$U
+      showNotification("Prior updated using manual parameters.", type="message")
+      return()
+    }
+
+    # Fit from elicitation
+    withProgress(message="Fitting prior...", {
+      res <- fit_prior_S(
+        L = input$L, U = input$U,
+        mean_val   = if(!is.na(input$mean_S))  input$mean_S  else NULL,
+        median_val = if(!is.na(input$med_S))   input$med_S   else NULL,
+        sd_val     = if(!is.na(input$sd_S))    input$sd_S    else NULL,
+        q025       = if(!is.na(input$q025_S))  input$q025_S  else NULL,
+        q975       = if(!is.na(input$q975_S))  input$q975_S  else NULL
+      )
+      rv$s1 <- res$s1; rv$s2 <- res$s2
+      rv$L  <- input$L; rv$U  <- input$U
+
+      if (!res$converged)
+        showNotification("Optimiser did not fully converge — results are approximate.", type="warning")
+      else
+        showNotification(sprintf("Prior fitted: s₁=%.3f, s₂=%.4f", res$s1, res$s2), type="message")
+    })
+  })
+
+  output$prior_s1_box <- renderValueBox({
+    valueBox(round(rv$s1, 3), "Shape s₁", icon=icon("shapes"), color="blue")
+  })
+  output$prior_s2_box <- renderValueBox({
+    valueBox(round(rv$s2, 4), "Scale s₂", icon=icon("ruler"), color="green")
+  })
+  output$prior_mean_box <- renderValueBox({
+    samps <- tryCatch(rtrunc(5000,"gamma",a=rv$L,b=rv$U,shape=rv$s1,scale=rv$s2), error=function(e) NULL)
+    m <- if (!is.null(samps)) round(mean(samps),3) else "—"
+    valueBox(m, "Prior mean of S", icon=icon("calculator"), color="yellow")
+  })
+
+  output$prior_plot <- renderPlotly({
+    samps <- tryCatch(rtrunc(10000,"gamma",a=rv$L,b=rv$U,shape=rv$s1,scale=rv$s2), error=function(e) NULL)
+    if (is.null(samps)) return(NULL)
+    df <- data.frame(S=samps)
+    p <- ggplot(df, aes(x=S)) +
+      geom_histogram(aes(y=after_stat(density)), bins=50,
+                     fill="#3498db", alpha=0.7, color="white") +
+      geom_density(color="#2c3e50", linewidth=1.2) +
+      geom_vline(xintercept=rv$L, color="#e74c3c", linetype="dashed", linewidth=1) +
+      geom_vline(xintercept=rv$U, color="#e74c3c", linetype="dashed", linewidth=1) +
+      labs(x="Delay Timepoint S (months)", y="Density",
+           title=sprintf("Truncated Gamma Prior: S ~ Gamma(%.2f, %.3f) I(%.1f, %.1f)",
+                         rv$s1, rv$s2, rv$L, rv$U)) +
+      theme_minimal(base_size=13) +
+      theme(plot.title=element_text(size=11, face="bold"))
+    ggplotly(p)
+  })
+
+  output$prior_summary_table <- renderTable({
+    samps <- tryCatch(rtrunc(10000,"gamma",a=rv$L,b=rv$U,shape=rv$s1,scale=rv$s2), error=function(e) NULL)
+    if (is.null(samps)) return(NULL)
+    data.frame(
+      Statistic = c("Mean","Median","Std Dev","2.5th pct","97.5th pct","Mode"),
+      Value = round(c(mean(samps), median(samps), sd(samps),
+                      quantile(samps,0.025), quantile(samps,0.975),
+                      (rv$s1-1)*rv$s2), 3)
+    )
+  }, striped=TRUE, hover=TRUE, bordered=TRUE)
+
+  output$prior_interpretation <- renderUI({
+    samps <- tryCatch(rtrunc(5000,"gamma",a=rv$L,b=rv$U,shape=rv$s1,scale=rv$s2), error=function(e) NULL)
+    if (is.null(samps)) return(NULL)
+    tags$div(
+      p(sprintf("The prior on S is bounded between %.1f and %.1f months.", rv$L, rv$U)),
+      p(sprintf("The expected delay is %.2f months (median: %.2f months).", mean(samps), median(samps))),
+      p(sprintf("There is 95%% prior probability that S lies between %.2f and %.2f months.",
+                quantile(samps,0.025), quantile(samps,0.975))),
+      p(style="color:#7f8c8d; font-size:11px;",
+        sprintf("Parameters: s₁ = %.3f (shape), s₂ = %.4f (scale)", rv$s1, rv$s2))
+    )
+  })
+
+  # ── SAMPLE SIZE TAB ────────────────────────────────────────────────────────
+  output$interim_fraction_ui_ss <- renderUI({
+    n <- input$n_interim_ss
+    if (n == 0) return(NULL)
+    fracs <- seq(0.5/n, 1 - 0.5/n, length.out=n)
+    lapply(1:n, function(i) {
+      numericInput(paste0("frac_ss_", i),
+                   sprintf("Interim %d fraction of N", i),
+                   value=round(fracs[i],2), min=0.1, max=0.95, step=0.05)
+    })
+  })
+
+  observeEvent(input$calc_ss, {
+    req(input$mu0_bar, input$mu1_bar, input$S_design)
+    req(input$mu1_bar > input$mu0_bar)
+
+    withProgress(message="Computing sample size...", {
+      # Simulation-based sample size search
+      mu0 <- input$mu0_bar; mu1 <- input$mu1_bar
+      S   <- input$S_design
+      al  <- input$alpha_ss; pw <- input$power_ss
+      a0  <- input$a0_ss; b0 <- input$b0_ss
+      a1  <- input$a1_ss; b1 <- input$b1_ss
+
+      # Simple lambda/gamma defaults for SS calculation
+      lam <- 0.5; gam <- 1.0
+      n_sim_ss <- 500
+
+      Ns <- seq(20, 200, by=10)
+      powers <- numeric(length(Ns))
+      t1es   <- numeric(length(Ns))
+
+      for (j in seq_along(Ns)) {
+        N <- Ns[j]
+        n_int_frac <- input$n_interim_ss
+        if (n_int_frac == 0) {
+          n_int <- integer(0)
+        } else {
+          fracs <- sapply(1:n_int_frac, function(i) {
+            v <- input[[paste0("frac_ss_", i)]]
+            if (is.null(v)) 0.5 else v
+          })
+          n_int <- round(fracs * N)
+        }
+
+        rej_h0 <- replicate(n_sim_ss, {
+          r <- simulate_one_trial(n_int, N, lam, gam,
+                                  mu0, null=TRUE, S_val=S,
+                                  a0=a0, b0=b0, a1=a1, b1=b1)
+          as.numeric(r$reject)
+        })
+        t1es[j] <- mean(rej_h0)
+
+        rej_h1 <- replicate(n_sim_ss, {
+          r <- simulate_one_trial(n_int, N, lam, gam,
+                                  mu0, mu1_bar=mu1, S_val=S, null=FALSE,
+                                  a0=a0, b0=b0, a1=a1, b1=b1)
+          as.numeric(r$reject)
+        })
+        powers[j] <- mean(rej_h1)
+      }
+
+      # Find smallest N achieving target power with type I <= alpha
+      valid <- which(t1es <= al + 0.02)  # small tolerance
+      if (length(valid) == 0) {
+        rv$ss_result <- list(found=FALSE, N=NA, power=NA, t1e=NA,
+                             Ns=Ns, powers=powers, t1es=t1es)
+      } else {
+        ok <- valid[powers[valid] >= pw]
+        if (length(ok) == 0) ok <- valid[which.max(powers[valid])]
+        idx <- min(ok)
+        rv$ss_result <- list(found=TRUE, N=Ns[idx], power=powers[idx], t1e=t1es[idx],
+                             Ns=Ns, powers=powers, t1es=t1es)
+      }
+    })
+  })
+
+  rv$ss_result <- NULL
+
+  output$ss_results_ui <- renderUI({
+    res <- rv$ss_result
+    if (is.null(res)) {
+      return(p(style="color:#95a5a6; font-style:italic;",
+               "Set parameters and click 'Calculate Sample Size'."))
+    }
+    if (!res$found) {
+      return(div(class="decision-box decision-stop",
+                 "No valid sample size found in range. Adjust parameters."))
+    }
+    fluidRow(
+      column(3, div(class="param-well", h4(class="result-label","Recommended N (per arm)"),
+                    h2(style="color:#27ae60;font-weight:700;", res$N))),
+      column(3, div(class="param-well", h4(class="result-label","Total 2N"),
+                    h2(style="color:#2980b9;font-weight:700;", res$N*2))),
+      column(3, div(class="param-well", h4(class="result-label","Estimated Power"),
+                    h2(style="color:#8e44ad;font-weight:700;", sprintf("%.1f%%", res$power*100)))),
+      column(3, div(class="param-well", h4(class="result-label","Type I Error"),
+                    h2(style="color:#e67e22;font-weight:700;", sprintf("%.1f%%", res$t1e*100))))
+    )
+  })
+
+  output$ss_power_curve <- renderPlotly({
+    res <- rv$ss_result
+    if (is.null(res)) return(NULL)
+    df <- data.frame(N=res$Ns, Power=res$powers, T1E=res$t1es)
+    p <- ggplot(df, aes(x=N*2)) +
+      geom_line(aes(y=Power, color="Power"), linewidth=1.3) +
+      geom_line(aes(y=T1E,   color="Type I Error"), linewidth=1.1, linetype="dashed") +
+      geom_hline(yintercept=input$power_ss, color="#27ae60", linetype="dotted", linewidth=0.8) +
+      geom_hline(yintercept=input$alpha_ss, color="#e74c3c", linetype="dotted", linewidth=0.8) +
+      scale_color_manual(values=c("Power"="#3498db","Type I Error"="#e74c3c")) +
+      labs(x="Total Sample Size (2N)", y="Probability", color="",
+           title="Power and Type I Error vs. Sample Size") +
+      theme_minimal(base_size=13) + ylim(0,1)
+    ggplotly(p)
+  })
+
+  # ── CALIBRATION TAB ────────────────────────────────────────────────────────
+  output$interim_sizes_ui <- renderUI({
+    tagList(
+      numericInput("n_interim_cal", "Number of interim analyses", value=1, min=0, max=4, step=1),
+      uiOutput("interim_n_inputs_cal")
+    )
+  })
+
+  output$interim_n_inputs_cal <- renderUI({
+    n <- input$n_interim_cal
+    if (is.null(n) || n == 0) return(NULL)
+    N <- input$N_cal / 2
+    lapply(1:n, function(i) {
+      numericInput(paste0("n_int_cal_", i),
+                   sprintf("Interim %d: sample size per arm", i),
+                   value=round(N * i/(n+1)), min=5, step=5)
+    })
+  })
+
+  observeEvent(input$run_calibration, {
+    req(input$N_cal, input$mu0_cal, input$mu1_cal)
+
+    withProgress(message="Running calibration...", {
+      N   <- input$N_cal / 2
+      n_i <- if (is.null(input$n_interim_cal) || input$n_interim_cal == 0) {
+        integer(0)
+      } else {
+        sapply(1:input$n_interim_cal, function(i) {
+          v <- input[[paste0("n_int_cal_", i)]]
+          if (is.null(v)) round(N * i/(input$n_interim_cal+1)) else v
+        })
+      }
+
+      lam_seq <- seq(input$lambda_range[1], input$lambda_range[2], by=0.1)
+      gam_seq <- seq(input$gamma_range[1],  input$gamma_range[2],  by=0.25)
+
+      grid_res <- list()
+      total_iter <- length(lam_seq) * length(gam_seq)
+      iter <- 0
+      best_power <- -Inf; best_lam <- NA; best_gam <- NA
+      best_t1e <- NA
+
+      for (lam in lam_seq) {
+        for (gam in gam_seq) {
+          iter <- iter + 1
+          setProgress(iter/total_iter,
+                      detail=sprintf("λ=%.2f, γ=%.2f (%d/%d)", lam, gam, iter, total_iter))
+
+          rej_h0 <- replicate(input$n_sim_cal, {
+            S_s <- rtrunc(1,"gamma",a=input$L_cal,b=input$U_cal,
+                          shape=input$s1_cal, scale=input$s2_cal)
+            r <- simulate_one_trial(n_i, N, lam, gam,
+                                    input$mu0_cal, null=TRUE, S_val=S_s,
+                                    a0=input$a0_cal, b0=input$b0_cal,
+                                    a1=input$a1_cal, b1=input$b1_cal)
+            as.numeric(r$reject)
+          })
+          t1e <- mean(rej_h0)
+
+          rej_h1 <- replicate(input$n_sim_cal, {
+            S_s <- rtrunc(1,"gamma",a=input$L_cal,b=input$U_cal,
+                          shape=input$s1_cal, scale=input$s2_cal)
+            r <- simulate_one_trial(n_i, N, lam, gam,
+                                    input$mu0_cal, mu1_bar=input$mu1_cal,
+                                    S_val=S_s, null=FALSE,
+                                    a0=input$a0_cal, b0=input$b0_cal,
+                                    a1=input$a1_cal, b1=input$b1_cal)
+            as.numeric(r$reject)
+          })
+          pwr <- mean(rej_h1)
+
+          grid_res[[length(grid_res)+1]] <- list(lambda=lam, gamma=gam, t1e=t1e, power=pwr)
+
+          if (t1e <= input$alpha_cal && pwr > best_power) {
+            best_power <- pwr; best_lam <- lam; best_gam <- gam; best_t1e <- t1e
+          }
+        }
+      }
+
+      rv$lambda_opt <- best_lam
+      rv$gamma_opt  <- best_gam
+      rv$cal_grid   <- do.call(rbind, lapply(grid_res, as.data.frame))
+      rv$cal_best   <- list(lambda=best_lam, gamma=best_gam,
+                            power=best_power, t1e=best_t1e)
+
+      # Update OC defaults
+      updateNumericInput(session, "lambda_oc", value=round(best_lam, 3))
+      updateNumericInput(session, "gamma_oc",  value=round(best_gam, 3))
+      updateNumericInput(session, "lambda_an", value=round(best_lam, 3))
+      updateNumericInput(session, "gamma_an",  value=round(best_gam, 3))
+    })
+  })
+
+  output$cal_results_ui <- renderUI({
+    b <- rv$cal_best
+    if (is.null(b)) {
+      return(p(style="color:#95a5a6; font-style:italic;",
+               "Set parameters and click 'Run Calibration'."))
+    }
+    if (is.na(b$lambda)) {
+      return(div(class="decision-box decision-stop",
+                 "No valid (λ, γ) found controlling type I error. Try larger grid or n_sim."))
+    }
+    tagList(
+      fluidRow(
+        column(3, div(class="param-well",
+                      h4(class="result-label","Optimal λ"),
+                      h2(style="color:#e74c3c;font-weight:700;", round(b$lambda,3)))),
+        column(3, div(class="param-well",
+                      h4(class="result-label","Optimal γ"),
+                      h2(style="color:#3498db;font-weight:700;", round(b$gamma,3)))),
+        column(3, div(class="param-well",
+                      h4(class="result-label","Power"),
+                      h2(style="color:#27ae60;font-weight:700;", sprintf("%.1f%%", b$power*100)))),
+        column(3, div(class="param-well",
+                      h4(class="result-label","Type I Error"),
+                      h2(style="color:#e67e22;font-weight:700;", sprintf("%.1f%%", b$t1e*100))))
+      ),
+      br(),
+      p(sprintf("Threshold function: C(n) = 1 − %.3f × (n/N)^%.3f", b$lambda, b$gamma),
+        style="font-family:monospace; font-size:14px;")
+    )
+  })
+
+  output$cal_grid_plot <- renderPlotly({
+    df <- rv$cal_grid
+    if (is.null(df)) return(NULL)
+    df$valid <- df$t1e <= input$alpha_cal
+    p <- ggplot(df, aes(x=lambda, y=gamma, fill=power, alpha=valid)) +
+      geom_tile() +
+      geom_text(aes(label=sprintf("%.2f", power)), size=2.5, color="white") +
+      scale_fill_gradient2(low="#e74c3c", mid="#f39c12", high="#27ae60",
+                           midpoint=0.6, limits=c(0,1)) +
+      scale_alpha_manual(values=c("FALSE"=0.2,"TRUE"=1)) +
+      labs(x="λ", y="γ", fill="Power",
+           title=sprintf("Power grid (shaded = type I error > %.2f)", input$alpha_cal)) +
+      theme_minimal(base_size=12)
+    ggplotly(p)
+  })
+
+  output$threshold_plot <- renderPlotly({
+    b <- rv$cal_best
+    if (is.null(b) || is.na(b$lambda)) return(NULL)
+    N <- input$N_cal / 2
+    n_seq <- seq(1, N, by=1)
+    C_seq <- threshold_C(n_seq, N, b$lambda, b$gamma)
+    df <- data.frame(n=n_seq*2, C=C_seq)
+    p <- ggplot(df, aes(x=n, y=C)) +
+      geom_line(color="#8e44ad", linewidth=1.5) +
+      geom_hline(yintercept=0.5, linetype="dashed", color="#95a5a6") +
+      labs(x="Current total sample size (2n)", y="C(n)",
+           title=sprintf("Adaptive threshold: C(n) = 1 − %.3f·(n/N)^%.3f",
+                         b$lambda, b$gamma)) +
+      theme_minimal(base_size=12) + ylim(0,1)
+    ggplotly(p)
+  })
+
+  # ── OC TAB ─────────────────────────────────────────────────────────────────
+  output$interim_oc_ui <- renderUI({
+    tagList(
+      numericInput("n_interim_oc_n", "Number of interim looks", value=1, min=0, max=4, step=1),
+      uiOutput("interim_oc_inputs")
+    )
+  })
+  output$interim_oc_inputs <- renderUI({
+    n <- input$n_interim_oc_n
+    if (is.null(n) || n==0) return(NULL)
+    N <- input$N_oc / 2
+    lapply(1:n, function(i) {
+      numericInput(paste0("n_oc_int_", i),
+                   sprintf("Interim %d: n per arm", i),
+                   value=round(N * i/(n+1)), min=5, step=5)
+    })
+  })
+
+  observeEvent(input$run_oc, {
+    req(input$N_oc, input$lambda_oc, input$gamma_oc)
+
+    withProgress(message="Simulating operating characteristics...", {
+      N   <- input$N_oc / 2
+      n_i <- if (is.null(input$n_interim_oc_n) || input$n_interim_oc_n == 0) {
+        integer(0)
+      } else {
+        sapply(1:input$n_interim_oc_n, function(i) {
+          v <- input[[paste0("n_oc_int_", i)]]
+          if (is.null(v)) round(N/2) else v
+        })
+      }
+
+      use_prior <- input$S_spec_oc == "prior"
+      S_fix     <- if (!use_prior) input$S_fixed_oc else NULL
+
+      oc <- compute_oc(
+        N_total  = N,
+        n_interim = n_i,
+        lambda   = input$lambda_oc,
+        gamma    = input$gamma_oc,
+        mu0_bar  = input$mu0_oc,
+        mu1_bar  = input$mu1_oc,
+        S_fixed  = S_fix,
+        s1 = if (use_prior) input$s1_oc else NULL,
+        s2 = if (use_prior) input$s2_oc else NULL,
+        L  = if (use_prior) input$L_oc  else NULL,
+        U  = if (use_prior) input$U_oc  else NULL,
+        a0 = input$a0_oc, b0=input$b0_oc,
+        a1 = input$a1_oc, b1=input$b1_oc,
+        n_sim    = input$n_sim_oc,
+        use_prior = use_prior
+      )
+      rv$oc_results <- oc
+
+      # Sensitivity analysis
+      if (input$run_sensitivity) {
+        S_vals <- seq(input$S_range_oc[1], input$S_range_oc[2], by=0.5)
+        sens <- lapply(S_vals, function(sv) {
+          setProgress(detail=sprintf("S = %.1f", sv))
+          oc_s <- compute_oc(N, n_i, input$lambda_oc, input$gamma_oc,
+                             input$mu0_oc, input$mu1_oc,
+                             S_fixed=sv, use_prior=FALSE,
+                             a0=input$a0_oc, b0=input$b0_oc,
+                             a1=input$a1_oc, b1=input$b1_oc,
+                             n_sim=min(input$n_sim_oc, 500))
+          list(S=sv, power=oc_s$power, t1e=oc_s$type1_error)
+        })
+        rv$oc_sensitivity <- do.call(rbind, lapply(sens, as.data.frame))
+      }
+    })
+  })
+
+  output$oc_results_ui <- renderUI({
+    oc <- rv$oc_results
+    if (is.null(oc)) {
+      return(p(style="color:#95a5a6; font-style:italic;",
+               "Set parameters and click 'Compute Operating Characteristics'."))
+    }
+    fluidRow(
+      column(2, div(class="param-well",
+                    h4(class="result-label","Type I Error"),
+                    h3(style="color:#e74c3c;font-weight:700;", sprintf("%.3f", oc$type1_error)))),
+      column(2, div(class="param-well",
+                    h4(class="result-label","Power"),
+                    h3(style="color:#27ae60;font-weight:700;", sprintf("%.3f", oc$power)))),
+      column(2, div(class="param-well",
+                    h4(class="result-label","PES (H₀)"),
+                    h3(style="color:#8e44ad;font-weight:700;", sprintf("%.3f", oc$pes_h0)))),
+      column(2, div(class="param-well",
+                    h4(class="result-label","PES (H₁)"),
+                    h3(style="color:#3498db;font-weight:700;", sprintf("%.3f", oc$pes_h1)))),
+      column(2, div(class="param-well",
+                    h4(class="result-label","Avg N (H₀)"),
+                    h3(style="color:#e67e22;font-weight:700;", sprintf("%.0f", oc$avg_n_h0)))),
+      column(2, div(class="param-well",
+                    h4(class="result-label","Avg N (H₁)"),
+                    h3(style="color:#1abc9c;font-weight:700;", sprintf("%.0f", oc$avg_n_h1))))
+    )
+  })
+
+  output$oc_bar_plot <- renderPlotly({
+    oc <- rv$oc_results
+    if (is.null(oc)) return(NULL)
+    df <- data.frame(
+      Metric = c("Type I Error","Power","PES (H₀)","PES (H₁)"),
+      Value  = c(oc$type1_error, oc$power, oc$pes_h0, oc$pes_h1),
+      Color  = c("#e74c3c","#27ae60","#8e44ad","#3498db")
+    )
+    p <- ggplot(df, aes(x=Metric, y=Value, fill=Metric)) +
+      geom_bar(stat="identity", width=0.6, alpha=0.85) +
+      geom_text(aes(label=sprintf("%.3f", Value)), vjust=-0.4, fontface="bold") +
+      scale_fill_manual(values=setNames(df$Color, df$Metric)) +
+      labs(title="Operating Characteristics", y="Probability") +
+      theme_minimal(base_size=12) + theme(legend.position="none") +
+      ylim(0, min(1.1, max(df$Value)*1.2))
+    ggplotly(p)
+  })
+
+  output$oc_sensitivity_plot <- renderPlotly({
+    df <- rv$oc_sensitivity
+    if (is.null(df)) return(NULL)
+    p <- ggplot(df, aes(x=S)) +
+      geom_line(aes(y=power, color="Power"),     linewidth=1.4) +
+      geom_line(aes(y=t1e,   color="Type I Error"), linewidth=1.2, linetype="dashed") +
+      scale_color_manual(values=c("Power"="#27ae60","Type I Error"="#e74c3c")) +
+      labs(x="Delay timepoint S (months)", y="Probability", color="",
+           title="Sensitivity of Power and Type I Error to S") +
+      theme_minimal(base_size=12) + ylim(0,1)
+    ggplotly(p)
+  })
+
+  # ── ANALYSIS TAB ───────────────────────────────────────────────────────────
+  observeEvent(input$run_analysis_btn, {
+    tryCatch({
+      t0 <- as.numeric(trimws(strsplit(input$t0_an, ",")[[1]]))
+      t1 <- as.numeric(trimws(strsplit(input$t1_an, ",")[[1]]))
+      d0 <- as.numeric(trimws(strsplit(input$d0_an, ",")[[1]]))
+      d1 <- as.numeric(trimws(strsplit(input$d1_an, ",")[[1]]))
+
+      validate(
+        need(!any(is.na(t0)), "Invalid control arm times"),
+        need(!any(is.na(t1)), "Invalid treatment arm times"),
+        need(!any(is.na(d0)), "Invalid control arm events"),
+        need(!any(is.na(d1)), "Invalid treatment arm events"),
+        need(length(t0)==length(d0), "t0 and δ0 must have same length"),
+        need(length(t1)==length(d1), "t1 and δ1 must have same length")
+      )
+
+      res <- run_analysis(
+        t0=t0, t1=t1, delta0=d0, delta1=d1,
+        S_val  = input$S_an,
+        n_total = input$N_an,
+        lambda  = input$lambda_an, gamma = input$gamma_an,
+        a0=input$a0_an, b0=input$b0_an,
+        a1=input$a1_an, b1=input$b1_an,
+        stage = input$stage_an
+      )
+      rv$analysis_result  <- res
+      rv$analysis_t0 <- t0; rv$analysis_t1 <- t1
+      rv$analysis_d0 <- d0; rv$analysis_d1 <- d1
+
+    }, error=function(e) {
+      showNotification(paste("Error:", e$message), type="error")
+    })
+  })
+
+  output$analysis_results_ui <- renderUI({
+    res <- rv$analysis_result
+    if (is.null(res)) {
+      return(p(style="color:#95a5a6; font-style:italic;",
+               "Enter data and click 'Run Analysis'."))
+    }
+    dec_class <- switch(res$decision,
+      "Stop for Futility"   = "decision-stop",
+      "Continue"            = "decision-continue",
+      "Reject H0 (Efficacy)"= "decision-reject",
+      "decision-fail"
+    )
+    tagList(
+      fluidRow(
+        column(4, div(class="param-well",
+          h4(class="result-label", "Posterior P(μ̃₁ < μ̃₀ | Data, S)"),
+          h2(style="color:#8e44ad;font-weight:700;", sprintf("%.4f", res$posterior_prob))
+        )),
+        column(4, div(class="param-well",
+          h4(class="result-label", "Adaptive Threshold C(n)"),
+          h2(style="color:#e67e22;font-weight:700;", sprintf("%.4f", res$threshold))
+        )),
+        column(4, div(class="param-well",
+          h4(class="result-label", "Stage"),
+          h2(style="color:#2c3e50;font-weight:700;", tools::toTitleCase(input$stage_an))
+        ))
+      ),
+      br(),
+      div(class=paste("decision-box", dec_class), icon("gavel"), " ", res$decision),
+      br(),
+      fluidRow(
+        column(3, p(strong("n (control):"), res$n_arm)),
+        column(3, p(strong("Events (control):"), res$events_control)),
+        column(3, p(strong("n (treatment):"), res$n_arm)),
+        column(3, p(strong("Events (treatment):"), res$events_treat))
+      ),
+      conditionalPanel("input.stage_an == 'interim'",
+        p(style="font-size:12px; color:#7f8c8d;",
+          sprintf("Decision rule: stop if P(μ̃₁ < μ̃₀) = %.4f > C(n) = %.4f → %s",
+                  res$posterior_prob, res$threshold,
+                  if (res$posterior_prob > res$threshold) "STOP" else "CONTINUE"))
+      ),
+      conditionalPanel("input.stage_an == 'final'",
+        p(style="font-size:12px; color:#7f8c8d;",
+          sprintf("Decision rule: reject H₀ if P(μ̃₁ < μ̃₀) = %.4f ≤ C(N) = %.4f → %s",
+                  res$posterior_prob, res$threshold,
+                  if (res$posterior_prob <= res$threshold) "REJECT" else "FAIL TO REJECT"))
+      )
+    )
+  })
+
+  output$analysis_posterior_plot <- renderPlotly({
+    res <- rv$analysis_result
+    if (is.null(res)) return(NULL)
+    # Show posterior probability relative to threshold
+    df <- data.frame(
+      x    = c("P(μ̃₁ < μ̃₀ | Data, S)", "Threshold C(n)"),
+      y    = c(res$posterior_prob, res$threshold),
+      fill = c(if(res$posterior_prob > res$threshold) "#e74c3c" else "#27ae60", "#f39c12")
+    )
+    p <- ggplot(df, aes(x=x, y=y, fill=fill)) +
+      geom_bar(stat="identity", width=0.5, alpha=0.85) +
+      geom_text(aes(label=sprintf("%.4f", y)), vjust=-0.4, fontface="bold") +
+      scale_fill_identity() +
+      labs(title="Posterior Probability vs. Threshold", y="Probability", x="") +
+      theme_minimal(base_size=12) + ylim(0, 1.1)
+    ggplotly(p)
+  })
+
+  output$analysis_km_plot <- renderPlotly({
+    t0 <- rv$analysis_t0; t1 <- rv$analysis_t1
+    d0 <- rv$analysis_d0; d1 <- rv$analysis_d1
+    if (is.null(t0)) return(NULL)
+
+    # Simple KM estimator
+    km_df <- function(times, events, group) {
+      ord <- order(times)
+      times <- times[ord]; events <- events[ord]
+      n <- length(times)
+      surv <- 1; rows <- list()
+      rows[[1]] <- data.frame(time=0, surv=1, group=group)
+      for (i in 1:n) {
+        if (events[i] == 1) {
+          n_at_risk <- n - i + 1
+          surv <- surv * (1 - 1/n_at_risk)
+        }
+        rows[[i+1]] <- data.frame(time=times[i], surv=surv, group=group)
+      }
+      do.call(rbind, rows)
+    }
+    df <- rbind(km_df(t0, d0, "Control"), km_df(t1, d1, "Treatment"))
+    p <- ggplot(df, aes(x=time, y=surv, color=group)) +
+      geom_step(linewidth=1.2) +
+      scale_color_manual(values=c("Control"="#e74c3c","Treatment"="#3498db")) +
+      labs(x="Time (months)", y="Survival Probability", color="Arm",
+           title="Kaplan-Meier Curves") +
+      theme_minimal(base_size=12) + ylim(0,1)
+    ggplotly(p)
+  })
+}
+
+shinyApp(ui, server)
